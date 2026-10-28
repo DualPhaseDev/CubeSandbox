@@ -309,17 +309,8 @@ func (l *local) createContainers(ctx context.Context, flowOpts *workflow.CreateC
 	}
 
 	l.storeNumaQueues(ctx, sandBox, flowOpts)
-	stampLaunchMemoryAncestorOnce(sandBox, resolveLaunchAncestorSnapshotID(sandBox))
-	if snapshotID, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.IsRetoreSnapshot() {
-		now := time.Now().UTC()
-		setRuntimeSnapshotBindingLabels(sandBox, snapshotID, now)
-		// Also stamp the restore-base label. Commit will advance the
-		// runtime-snapshot binding above; this label stays pinned at the
-		// memory image the VM was actually restored from, so the
-		// pagemap_anon fallback in CommitSandbox can still locate a
-		// reflinkable base after the most recent commit's snapshot is
-		// deleted.
-		setRuntimeRestoreBaseLabels(sandBox, snapshotID, now)
+	applyCreateMemoryLineage(sandBox, flowOpts)
+	if _, ok := flowOpts.GetSnapshotTemplateID(); ok && flowOpts.IsRetoreSnapshot() {
 		// Resume-from-pause stamps pause snapshot id. Master strips this
 		// key from user Create; only the thin Resume request carries it.
 		// Resume still needs that package (XFS mmap; S3 Snapshot
@@ -1472,6 +1463,22 @@ func (l *local) runContainer(
 	taskStart := time.Now()
 	task, err := c.NewTask(ctx, ioCreater, taskOpts...)
 	if err != nil {
+		// Reap for every container, not only the pod. CubeShim answers
+		// "start" with a bare address, so containerd records the endpoint as
+		// version 2, and ShimManager.Start runs the shim binary again for any
+		// version < 3 even when the sandbox already exists. A workload
+		// container therefore gets its own shim server, started with
+		// -id <container id>, and that one leaks the same way when its
+		// create fails. Match ci.ID, never the sandbox id.
+		if survivors := reapOrphanShims(ctx, ci.ID); survivors > 0 && ci.IsPod {
+			// The bundle is already gone, so withdrawShimIntent cannot see
+			// these shims through the pid files. Keep the intent: it is what
+			// stops the destroy path from releasing the tap, IP and volumes
+			// a surviving shim may still hold.
+			log.G(ctx).Errorf("shim intent for %s kept: %d orphan shim(s) could not be reaped",
+				sandboxIdentity(cubebox), survivors)
+			withdrawIntent = func() {}
+		}
 		return transformError(err)
 	}
 	workflow.RecordCreateMetric(ctx, err,
@@ -1928,4 +1935,30 @@ func (l *local) genHooksOpts(ctx context.Context, flowOpts *workflow.CreateConte
 		}
 		return nil
 	}, nil
+}
+
+// applyCreateMemoryLineage decides this row's memory lineage from the create
+// request. It is the only place where request annotations may become a memory
+// base, and only for a create that actually restores guest memory.
+//
+// Every row gets a non-nil lineage so "no base" is explicit and recovery never
+// re-derives one from labels or annotations. A restart is a cold boot: it gets
+// the empty lineage and therefore cannot inherit the pre-restart memory image.
+func applyCreateMemoryLineage(cb *cubeboxstore.CubeBox, flowOpts *workflow.CreateContext) {
+	if cb == nil {
+		return
+	}
+	cb.MemoryLineage = &cubeboxstore.MemoryLineage{}
+	if flowOpts == nil || flowOpts.IsRestart {
+		return
+	}
+	snapshotID, ok := flowOpts.GetSnapshotTemplateID()
+	if !ok || !flowOpts.IsRetoreSnapshot() {
+		return
+	}
+	cb.BindLaunchAncestorOnce(launchAncestorFromRequest(cb))
+	// Runtime is what the next soft-dirty commit clones; restore stays pinned
+	// to the image this VM was actually restored from.
+	cb.BindRuntimeBase(snapshotID)
+	cb.BindRestoreBase(snapshotID)
 }

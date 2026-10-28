@@ -30,6 +30,7 @@ use crate::{
 const RET_CODE_OK: i32 = 0;
 const RET_CODE_HTTP_OK: i32 = 200;
 const RET_CODE_NOT_FOUND: i32 = 130404;
+const RET_CODE_NOT_FOUND_AT_CUBELET: i32 = 130406;
 const RET_CODE_CONFLICT: i32 = 130409;
 const RET_CODE_TASK_STATE_INVALID: i32 = 130490;
 const RET_CODE_TASK_RESUME_FAILED: i32 = 130589;
@@ -302,10 +303,14 @@ impl SandboxService {
 
     pub async fn get_sandbox(&self, sandbox_id: &str) -> AppResult<SandboxDetail> {
         let d = self.fetch_sandbox_detail(sandbox_id).await?;
+        // Keep the raw list time so its `now` fallback cannot hide the info time.
         let summary = self.fetch_sandbox_summary(sandbox_id, &d.host_id).await?;
         let started_at = summary
             .as_ref()
-            .and_then(|s| s.started_at.as_ref().cloned())
+            .and_then(|s| {
+                s.started_at
+                    .or_else(|| datetime_from_unix_nanos(s.create_at))
+            })
             .or(d.started_at)
             .unwrap_or_else(chrono::Utc::now);
         // Leave end_at as None for never-timeout sandboxes (CubeMaster returns
@@ -586,14 +591,6 @@ impl SandboxService {
         // FinishedAt (Cubelet/services/cubebox/pause_cow.go), so pause and
         // failed-pause windows surface as `Pausing`/`Paused`/`Unknown`, which
         // still take the connect paths below.
-        if matches!(&d.status, SandboxStatus::Stopped | SandboxStatus::Error) {
-            return Err(AppError::Conflict(format!(
-                "sandbox {} is not connectable in state '{}'",
-                sandbox_id,
-                sandbox_status_label(&d.status)
-            )));
-        }
-
         if d.status == SandboxStatus::Paused {
             let resume_timeout = timeout.filter(|timeout| {
                 should_extend_connect_timeout(d.end_at.clone(), *timeout, chrono::Utc::now())
@@ -625,13 +622,19 @@ impl SandboxService {
             if let Some(timeout) = timeout {
                 // Preserve a known longer deadline during the short
                 // CREATED/PAUSING transition. Missing metadata is left alone
-                // because it also represents never-timeout sandboxes. Terminal
-                // states never reach this arm: the guard above rejects
-                // `Stopped` before the state machine runs.
+                // because it also represents never-timeout sandboxes.
                 if should_extend_connect_timeout(d.end_at.clone(), timeout, chrono::Utc::now()) {
                     self.set_timeout(sandbox_id, timeout).await?;
                 }
             }
+        }
+
+        if matches!(&d.status, SandboxStatus::Stopped | SandboxStatus::Error) {
+            return Err(AppError::Conflict(format!(
+                "sandbox {} is not connectable in state '{}'",
+                sandbox_id,
+                sandbox_status_label(&d.status)
+            )));
         }
 
         let envd_version = envd_version_from_annotations(&d.annotations);
@@ -882,10 +885,13 @@ impl SandboxService {
             .cubemaster
             .get_sandbox(sandbox_id, &self.instance_type)
             .await
-            .map_err(|e| sandbox_not_found_or_internal(e, sandbox_id))?;
+            .map_err(|e| map_sandbox_detail_err(e, sandbox_id))?;
 
         if !is_success_ret_code(resp.ret.ret_code) {
-            if resp.ret.ret_code == RET_CODE_NOT_FOUND {
+            if matches!(
+                resp.ret.ret_code,
+                RET_CODE_NOT_FOUND | RET_CODE_NOT_FOUND_AT_CUBELET
+            ) {
                 return Err(AppError::NotFound(format!(
                     "sandbox {} not found",
                     sandbox_id
@@ -1236,6 +1242,20 @@ fn ensure_create_result(ret_code: i32, ret_msg: String) -> AppResult<()> {
         return Err(AppError::Conflict(ret_msg));
     }
     Err(AppError::Internal(anyhow::anyhow!(ret_msg)))
+}
+
+// CubeMaster returns NotFoundAtCubelet when a cached route reaches a Cubelet
+// that successfully answers with no sandbox. Keep this detail-only: other
+// resources use different not-found contracts, and transport failures are 5xx.
+fn map_sandbox_detail_err(e: CubeMasterError, sandbox_id: &str) -> AppError {
+    match e {
+        CubeMasterError::Api { ret_code, .. }
+            if matches!(ret_code, RET_CODE_NOT_FOUND | RET_CODE_NOT_FOUND_AT_CUBELET) =>
+        {
+            AppError::NotFound(format!("sandbox {} not found", sandbox_id))
+        }
+        other => params_error_or_internal(other),
+    }
 }
 
 fn sandbox_not_found_or_internal(e: CubeMasterError, sandbox_id: &str) -> AppError {
@@ -2075,6 +2095,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_checks_status_after_resume() {
+        for (status_after_resume, should_reject) in [(1, false), (2, true)] {
+            let status = Arc::new(Mutex::new(5));
+            let service = spawn_fake_cubemaster(
+                Router::new()
+                    .route(
+                        "/cube/sandbox/info",
+                        get(|State(status): State<Arc<Mutex<i32>>>| async move {
+                            sandbox_detail_envelope(*status.lock().await)
+                        }),
+                    )
+                    .route(
+                        "/cube/sandbox/update",
+                        post(move |State(status): State<Arc<Mutex<i32>>>| async move {
+                            *status.lock().await = status_after_resume;
+                            ret_envelope(0, "ok")
+                        }),
+                    )
+                    .with_state(status),
+            )
+            .await;
+
+            let result = service.connect_sandbox("sbx-1", None).await;
+            if should_reject {
+                let err = result.expect_err("a sandbox that exited after resume must not connect");
+                assert!(matches!(err, AppError::Conflict(ref m) if m.contains("stopped")));
+                assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+            } else {
+                assert_eq!(
+                    result
+                        .expect("a resumed running sandbox should connect")
+                        .sandbox_id,
+                    "sbx-1"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn connect_still_succeeds_for_running_sandbox() {
         let service = spawn_fake_cubemaster(Router::new().route(
             "/cube/sandbox/info",
@@ -2318,6 +2377,145 @@ mod tests {
             .await
             .expect_err("rejected detail request should not succeed");
         assert_bad_request(err, reason);
+    }
+
+    #[tokio::test]
+    async fn detail_and_connect_map_cubelet_absence_to_not_found() {
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/info",
+            get(|| async { ret_envelope(130406, "NotFoundAtCubelet") }),
+        ))
+        .await;
+
+        let detail_err = service
+            .get_sandbox("sb-stale-route")
+            .await
+            .expect_err("detail of an absent runtime should fail");
+        assert_eq!(detail_err.into_response().status(), StatusCode::NOT_FOUND);
+
+        let connect_err = service
+            .connect_sandbox("sb-stale-route", None)
+            .await
+            .expect_err("connect to an absent runtime should fail");
+        assert_eq!(connect_err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn detail_keeps_cubelet_request_failure_internal() {
+        let service = spawn_fake_cubemaster(Router::new().route(
+            "/cube/sandbox/info",
+            get(|| async { ret_envelope(130595, "Cubelet request failed") }),
+        ))
+        .await;
+
+        let err = service
+            .get_sandbox("sb-upstream-failure")
+            .await
+            .expect_err("a Cubelet request failure must remain internal");
+        assert_eq!(
+            err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_sandbox_detail_uses_list_start_time_fallback() {
+        async fn info_handler() -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-info",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "data": [{
+                    "sandbox_id": "sb-paused",
+                    "host_id": "host-1",
+                    "status": 5,
+                    "containers": [{
+                        "container_id": "sb-paused",
+                        "type": "sandbox",
+                        "create_at": 1_700_000_060_000_000_000i64
+                    }]
+                }]
+            }))
+        }
+
+        async fn list_handler() -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-list",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "data": [{
+                    "sandbox_id": "sb-paused",
+                    "host_id": "host-1",
+                    "status": 5,
+                    "create_at": 1_700_000_000_000_000_000i64
+                }]
+            }))
+        }
+
+        let service = spawn_fake_cubemaster(
+            Router::new()
+                .route("/cube/sandbox/info", get(info_handler))
+                .route("/cube/sandbox/list", post(list_handler)),
+        )
+        .await;
+
+        let listed = service
+            .list(None, None, 10)
+            .await
+            .expect("list should succeed");
+        let detail = service
+            .get_sandbox("sb-paused")
+            .await
+            .expect("detail should succeed");
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid sandbox creation time");
+        assert_eq!(listed[0].started_at, expected);
+        assert_eq!(detail.started_at, listed[0].started_at);
+    }
+
+    #[tokio::test]
+    async fn paused_sandbox_detail_uses_info_time_when_list_time_missing() {
+        async fn info_handler() -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-info",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "data": [{
+                    "sandbox_id": "sb-paused",
+                    "host_id": "host-1",
+                    "status": 5,
+                    "containers": [{
+                        "container_id": "sb-paused",
+                        "type": "sandbox",
+                        "create_at": 1_700_000_060_000_000_000i64
+                    }]
+                }]
+            }))
+        }
+
+        async fn list_handler() -> Json<Value> {
+            Json(serde_json::json!({
+                "requestID": "req-list",
+                "ret": { "ret_code": 0, "ret_msg": "ok" },
+                "data": [{
+                    "sandbox_id": "sb-paused",
+                    "host_id": "host-1",
+                    "status": 5
+                }]
+            }))
+        }
+
+        let service = spawn_fake_cubemaster(
+            Router::new()
+                .route("/cube/sandbox/info", get(info_handler))
+                .route("/cube/sandbox/list", post(list_handler)),
+        )
+        .await;
+
+        let detail = service
+            .get_sandbox("sb-paused")
+            .await
+            .expect("detail should succeed");
+        let expected = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_060, 0)
+            .expect("valid container creation time");
+        assert_eq!(detail.started_at, expected);
     }
 
     #[tokio::test]

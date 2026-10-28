@@ -1484,6 +1484,11 @@ components:
           items:
             type: string
           description: Override container CMD args.
+        backend:
+          type:
+          - string
+          - 'null'
+          description: CoW backend for this template and its sandboxes/snapshots (xfs | s3). Omitted keeps the historical xfs path.
         command:
           type:
           - array
@@ -1827,11 +1832,7 @@ components:
       type: object
       required:
       - status
-      - sandboxes
       properties:
-        sandboxes:
-          type: integer
-          minimum: 0
         status:
           type: string
     ListedSandbox:
